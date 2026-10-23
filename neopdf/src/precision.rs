@@ -267,6 +267,22 @@ impl<A: Arithmetic> LogCubicTable<A> {
 
     /// Evaluate without extrapolation or a conversion to binary64.
     pub fn evaluate(&self, coordinate: &A::Scalar) -> Result<A::Scalar, InterpolationError> {
+        self.evaluate_with_interval(coordinate)
+            .map(|(value, _)| value)
+    }
+
+    /// Evaluate and return the actual lower-endpoint index of the interval used.
+    ///
+    /// Both results come from the same lookup and interpolation operation. An
+    /// exact interior knot selects the interval to its right; the final knot
+    /// selects the last interval. Both outer endpoints are included, with no
+    /// tolerance snapping or conversion of the query to binary64. For a table
+    /// built from Q knots, the index refers to their squares in the selected
+    /// arithmetic. Metadata is returned only when evaluation succeeds.
+    pub fn evaluate_with_interval(
+        &self,
+        coordinate: &A::Scalar,
+    ) -> Result<(A::Scalar, usize), InterpolationError> {
         let a = &self.arithmetic;
         let (i, t) = self.axis.locate(a, coordinate)?;
         let dx = a.sub(&self.axis.logs[i + 1], &self.axis.logs[i]);
@@ -279,11 +295,24 @@ impl<A: Arithmetic> LogCubicTable<A> {
             &a.mul(&self.derivatives[i + 1], &dx),
         );
         if a.is_finite(&result) {
-            Ok(result)
+            Ok((result, i))
         } else {
             Err(InterpolationError::NonFinite)
         }
     }
+}
+
+/// The actual polynomial cell used by a successful collinear grid evaluation.
+///
+/// Indices identify lower endpoints in the immutable input grid, not knot
+/// values or an independently recomputed query location. Their interpretation
+/// therefore requires the identity and preparation options of that grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GridCell {
+    /// Lower-endpoint index along the x axis.
+    pub x_interval: usize,
+    /// Lower-endpoint index along the Q-squared axis.
+    pub q2_interval: usize,
 }
 
 /// A scalar-generic rectangular collinear log-Hermite grid.
@@ -443,6 +472,25 @@ impl<A: Arithmetic> LogBicubicGrid<A> {
         x: &A::Scalar,
         q2: &A::Scalar,
     ) -> Result<A::Scalar, InterpolationError> {
+        self.evaluate_with_cell(flavor, x, q2)
+            .map(|(value, _)| value)
+    }
+
+    /// Evaluate `x*f` and return the actual cell used by this operation.
+    ///
+    /// Lookup and interpolation occur once in the selected arithmetic. On each
+    /// axis, an exact interior knot selects the interval to its right, while
+    /// the final knot selects the last interval. Both outer endpoints are
+    /// included, without tolerance snapping or narrowing the query. If the
+    /// grid was built from Q knots, the Q-squared index refers to their squares
+    /// in that arithmetic. Caller-owned segment, flavor-identity and positivity
+    /// policies are not inferred here. Metadata is returned only on success.
+    pub fn evaluate_with_cell(
+        &self,
+        flavor: usize,
+        x: &A::Scalar,
+        q2: &A::Scalar,
+    ) -> Result<(A::Scalar, GridCell), InterpolationError> {
         if flavor >= self.flavors {
             return Err(InterpolationError::InvalidFlavor);
         }
@@ -474,7 +522,13 @@ impl<A: Arithmetic> LogBicubicGrid<A> {
         let dh = a.mul(&derivative(a, knots, &values, j + 1), &dq);
         let result = hermite(a, &v, &values[j], &dl, &values[j + 1], &dh);
         if a.is_finite(&result) {
-            Ok(result)
+            Ok((
+                result,
+                GridCell {
+                    x_interval: ix,
+                    q2_interval: iq,
+                },
+            ))
         } else {
             Err(InterpolationError::NonFinite)
         }
@@ -589,5 +643,243 @@ mod tests {
         let x = (xs[1] * xs[2]).sqrt();
         let q2 = qs[0] * qs[1];
         assert!((grid.evaluate(0, &x, &q2).unwrap() - 3.0).abs() < 1e-14);
+    }
+
+    #[test]
+    fn located_values_follow_log_affine_oracles_and_endpoint_ownership() {
+        let knots: [f64; 4] = [1.0, 2.0, 4.0, 8.0];
+        let table = LogCubicTable::new(Binary64, &knots, &[7.0, 9.0, 11.0, 13.0]).unwrap();
+        let queries = [
+            (1.0, 0),
+            (1.5, 0),
+            (f64::from_bits(2.0_f64.to_bits() - 1), 0),
+            (2.0, 1),
+            (f64::from_bits(2.0_f64.to_bits() + 1), 1),
+            (3.0, 1),
+            (4.0, 2),
+            (6.0, 2),
+            (8.0, 2),
+        ];
+        for (query, expected_interval) in queries {
+            let (value, interval) = table.evaluate_with_interval(&query).unwrap();
+            assert_eq!(interval, expected_interval);
+            assert!((value - (7.0 + 2.0 * query.log2())).abs() < 1e-13);
+            assert_eq!(value, table.evaluate(&query).unwrap());
+        }
+
+        let xs: [f64; 4] = [0.125, 0.25, 0.5, 1.0];
+        let grid = LogBicubicGrid::new(Binary64, &xs, &knots, 2, |flavor, ix, iq| {
+            3.0 + flavor as f64 + 2.0 * xs[ix].log2() - knots[iq].log2()
+        })
+        .unwrap();
+        for (x, x_interval) in [
+            (0.125, 0),
+            (0.2, 0),
+            (f64::from_bits(0.25_f64.to_bits() - 1), 0),
+            (0.25, 1),
+            (f64::from_bits(0.25_f64.to_bits() + 1), 1),
+            (0.375, 1),
+            (0.5, 2),
+            (0.75, 2),
+            (1.0, 2),
+        ] {
+            for (q2, q2_interval) in queries {
+                for flavor in 0..2 {
+                    let (value, cell) = grid.evaluate_with_cell(flavor, &x, &q2).unwrap();
+                    assert_eq!(
+                        cell,
+                        GridCell {
+                            x_interval,
+                            q2_interval
+                        }
+                    );
+                    let expected = 3.0 + flavor as f64 + 2.0 * x.log2() - q2.log2();
+                    assert!((value - expected).abs() < 1e-13);
+                    assert_eq!(value, grid.evaluate(flavor, &x, &q2).unwrap());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn equal_values_do_not_hide_distinct_lookup_cells() {
+        let table = LogCubicTable::new(Binary64, &[1.0, 2.0, 4.0], &[0.0; 3]).unwrap();
+        assert_eq!(table.evaluate_with_interval(&1.5).unwrap(), (0.0, 0));
+        assert_eq!(table.evaluate_with_interval(&3.0).unwrap(), (0.0, 1));
+        let grid = LogBicubicGrid::new(
+            Binary64,
+            &[0.125, 0.25, 1.0],
+            &[1.0, 2.0, 4.0],
+            1,
+            |_, _, _| 0.0,
+        )
+        .unwrap();
+        for (x, x_interval) in [(0.2, 0), (0.5, 1)] {
+            for (q2, q2_interval) in [(1.5, 0), (3.0, 1)] {
+                assert_eq!(
+                    grid.evaluate_with_cell(0, &x, &q2).unwrap(),
+                    (
+                        0.0,
+                        GridCell {
+                            x_interval,
+                            q2_interval
+                        }
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn located_values_retain_original_q_and_two_knot_policies() {
+        let qs: [f64; 3] = [1.4, 4.0, 8.0];
+        let table = LogCubicTable::from_q_knots(Binary64, &qs, &[0.3, 0.2, 0.1]).unwrap();
+        for (q2, expected_interval) in [
+            (qs[0] * qs[0], 0),
+            (f64::from_bits((qs[1] * qs[1]).to_bits() - 1), 0),
+            (qs[1] * qs[1], 1),
+            (qs[2] * qs[2], 1),
+        ] {
+            let (value, interval) = table.evaluate_with_interval(&q2).unwrap();
+            assert_eq!(interval, expected_interval);
+            assert_eq!(value, table.evaluate(&q2).unwrap());
+        }
+        let xs: [f64; 4] = [0.125, 0.25, 0.5, 1.0];
+        let grid = LogBicubicGrid::with_options(
+            Binary64,
+            &xs,
+            &qs[..2],
+            1,
+            |_, ix, iq| (ix * ix + iq) as f64,
+            GridOptions {
+                scale_axis: ScaleAxis::Q,
+                two_point_q: TwoPointQ::LogBilinear,
+            },
+        )
+        .unwrap();
+        let x = (xs[1] * xs[2]).sqrt();
+        let q2 = qs[0] * qs[1];
+        let (value, cell) = grid.evaluate_with_cell(0, &x, &q2).unwrap();
+        assert_eq!(
+            cell,
+            GridCell {
+                x_interval: 1,
+                q2_interval: 0
+            }
+        );
+        assert!((value - 3.0).abs() < 1e-14);
+        for (x, q2, expected) in [
+            (
+                xs[0],
+                qs[0] * qs[0],
+                GridCell {
+                    x_interval: 0,
+                    q2_interval: 0,
+                },
+            ),
+            (
+                xs[3],
+                qs[1] * qs[1],
+                GridCell {
+                    x_interval: 2,
+                    q2_interval: 0,
+                },
+            ),
+        ] {
+            let (value, cell) = grid.evaluate_with_cell(0, &x, &q2).unwrap();
+            assert_eq!(cell, expected);
+            assert_eq!(value, grid.evaluate(0, &x, &q2).unwrap());
+        }
+    }
+
+    #[test]
+    fn metadata_evaluation_retains_error_categories_and_order() {
+        let table = LogCubicTable::new(Binary64, &[1.0, 2.0], &[0.3, 0.2]).unwrap();
+        for (query, error) in [
+            (0.5, InterpolationError::OutOfRange),
+            (3.0, InterpolationError::OutOfRange),
+            (f64::NAN, InterpolationError::NonFinite),
+            (f64::INFINITY, InterpolationError::NonFinite),
+        ] {
+            assert_eq!(table.evaluate_with_interval(&query).unwrap_err(), error);
+            assert_eq!(table.evaluate(&query).unwrap_err(), error);
+        }
+        let grid =
+            LogBicubicGrid::new(Binary64, &[0.125, 1.0], &[1.0, 4.0], 1, |_, _, _| 0.0).unwrap();
+        for (flavor, x, q2, error) in [
+            (1, f64::NAN, f64::NAN, InterpolationError::InvalidFlavor),
+            (0, 0.01, f64::NAN, InterpolationError::OutOfRange),
+            (0, f64::NAN, 5.0, InterpolationError::NonFinite),
+            (0, 0.5, 5.0, InterpolationError::OutOfRange),
+            (0, 0.5, f64::NAN, InterpolationError::NonFinite),
+        ] {
+            assert_eq!(grid.evaluate_with_cell(flavor, &x, &q2).unwrap_err(), error);
+            assert_eq!(grid.evaluate(flavor, &x, &q2).unwrap_err(), error);
+        }
+    }
+
+    #[test]
+    fn metadata_is_collected_without_repeating_query_logarithms() {
+        use std::{cell::Cell, rc::Rc};
+        #[derive(Clone)]
+        struct CountLogs(Rc<Cell<usize>>);
+        impl Arithmetic for CountLogs {
+            type Scalar = f64;
+            fn lift(&self, value: f64) -> f64 {
+                value
+            }
+            fn add(&self, a: &f64, b: &f64) -> f64 {
+                a + b
+            }
+            fn sub(&self, a: &f64, b: &f64) -> f64 {
+                a - b
+            }
+            fn mul(&self, a: &f64, b: &f64) -> f64 {
+                a * b
+            }
+            fn div(&self, a: &f64, b: &f64) -> f64 {
+                a / b
+            }
+            fn ln(&self, value: &f64) -> f64 {
+                self.0.set(self.0.get() + 1);
+                value.ln()
+            }
+            fn compare(&self, a: &f64, b: &f64) -> Option<Ordering> {
+                a.partial_cmp(b)
+            }
+            fn is_finite(&self, value: &f64) -> bool {
+                value.is_finite()
+            }
+        }
+        let calls = Rc::new(Cell::new(0));
+        let table =
+            LogCubicTable::new(CountLogs(calls.clone()), &[1.0, 2.0, 4.0], &[0.3, 0.2, 0.1])
+                .unwrap();
+        calls.set(0);
+        let (located, interval) = table.evaluate_with_interval(&1.5).unwrap();
+        assert_eq!(interval, 0);
+        assert_eq!(calls.replace(0), 1);
+        assert_eq!(table.evaluate(&1.5).unwrap(), located);
+        assert_eq!(calls.replace(0), 1);
+        let grid = LogBicubicGrid::new(
+            CountLogs(calls.clone()),
+            &[0.125, 0.25, 1.0],
+            &[1.0, 2.0, 4.0],
+            1,
+            |_, ix, iq| (ix + iq) as f64,
+        )
+        .unwrap();
+        calls.set(0);
+        let (located, cell) = grid.evaluate_with_cell(0, &0.5, &1.5).unwrap();
+        assert_eq!(
+            cell,
+            GridCell {
+                x_interval: 1,
+                q2_interval: 0
+            }
+        );
+        assert_eq!(calls.replace(0), 2);
+        assert_eq!(grid.evaluate(0, &0.5, &1.5).unwrap(), located);
+        assert_eq!(calls.get(), 2);
     }
 }
